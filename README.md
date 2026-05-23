@@ -61,6 +61,8 @@ PROD_DB_DATABASE=app_production
 | `DB_SYNC_LOCAL_CONNECTION`   | `config('database.default')` | Local connection (from `config/database.php`) to replace. |
 | `DB_SYNC_BACKUP_DIR`         | `storage/backups`         | Where local and production dumps are written.         |
 
+The backup directory is created on first run and seeded with a `.gitignore` that ignores its own contents, so dumps don't accidentally end up in version control.
+
 ## Usage
 
 ```bash

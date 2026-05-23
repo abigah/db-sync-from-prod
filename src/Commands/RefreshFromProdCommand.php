@@ -62,6 +62,11 @@ class RefreshFromProdCommand extends Command
             mkdir($backupDir, 0755, true);
         }
 
+        $gitignorePath = "{$backupDir}/.gitignore";
+        if (! file_exists($gitignorePath)) {
+            file_put_contents($gitignorePath, "*\n!.gitignore\n");
+        }
+
         $timestamp = now()->format('Y-m-d_His');
         $localDumpPath = "{$backupDir}/local-backup-{$timestamp}.sql";
 

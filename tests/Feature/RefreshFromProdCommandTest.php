@@ -193,6 +193,34 @@ it('completes a full refresh on the happy path', function () {
     Process::assertRan(fn ($process) => str_starts_with((string) $process->command, 'kill '));
 });
 
+it('writes a .gitignore into the backup dir on first run', function () {
+    $stub = stubCommand();
+    $stub->dumpShouldFail = true;
+
+    expect(is_dir($this->tempBackupDir))->toBeFalse();
+
+    $this->artisan('db:refresh-from-prod')
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(1);
+
+    expect(file_get_contents($this->tempBackupDir.'/.gitignore'))
+        ->toBe("*\n!.gitignore\n");
+});
+
+it('does not overwrite an existing .gitignore in the backup dir', function () {
+    mkdir($this->tempBackupDir, 0755, true);
+    file_put_contents($this->tempBackupDir.'/.gitignore', "custom\n");
+
+    $stub = stubCommand();
+    $stub->dumpShouldFail = true;
+
+    $this->artisan('db:refresh-from-prod')
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(1);
+
+    expect(file_get_contents($this->tempBackupDir.'/.gitignore'))->toBe("custom\n");
+});
+
 it('skips the local backup when --skip-local-backup is passed', function () {
     $stub = stubCommand();
 
