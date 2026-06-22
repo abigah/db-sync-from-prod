@@ -9,10 +9,10 @@ use Illuminate\Support\Facades\Process;
 class RefreshFromProdCommand extends Command
 {
     protected $signature = 'db:refresh-from-prod
-                            {--dump= : Path to an existing prod dump file to import (skips SSH tunnel and mysqldump)}
+                            {--dump= : Path to an existing dump/snapshot file to import (skips the production download)}
                             {--skip-local-backup : Skip backing up the local database before import}';
 
-    protected $description = 'Replace the local database with a copy of the production database via SSH tunnel';
+    protected $description = 'Replace the local database with a copy of the production database via SSH';
 
     private ?int $tunnelPid = null;
 
@@ -26,6 +26,259 @@ class RefreshFromProdCommand extends Command
 
         $connectionName = config('db-sync-from-prod.local_connection');
         $localConfig = config("database.connections.{$connectionName}");
+        $driver = $localConfig['driver'] ?? null;
+
+        return match ($driver) {
+            'sqlite' => $this->syncSqlite($connectionName, $localConfig),
+            'mysql', 'mariadb' => $this->syncMysql($connectionName, $localConfig),
+            default => $this->unsupportedDriver($driver),
+        };
+    }
+
+    private function unsupportedDriver(?string $driver): int
+    {
+        $this->error('Unsupported database driver: '.($driver ?? 'null').'. Only sqlite and mysql are supported.');
+
+        return Command::FAILURE;
+    }
+
+    /**
+     * Ensure the backup directory exists and is ignored by git.
+     */
+    private function ensureBackupDir(): string
+    {
+        $backupDir = config('db-sync-from-prod.backup_dir');
+
+        if (! is_dir($backupDir)) {
+            mkdir($backupDir, 0755, true);
+        }
+
+        $gitignorePath = "{$backupDir}/.gitignore";
+        if (! file_exists($gitignorePath)) {
+            file_put_contents($gitignorePath, "*\n!.gitignore\n");
+        }
+
+        return $backupDir;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | SQLite
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * @param  array{database: string}  $localConfig
+     */
+    private function syncSqlite(string $connectionName, array $localConfig): int
+    {
+        $localPath = $localConfig['database'];
+        $existingDump = $this->option('dump');
+
+        if ($existingDump) {
+            if (! is_file($existingDump)) {
+                $this->error("Dump file not found: {$existingDump}");
+
+                return Command::FAILURE;
+            }
+
+            $this->warn("This will replace your local database ({$localPath}) with the dump at {$existingDump}.");
+        } else {
+            $sshHost = config('db-sync-from-prod.prod_ssh.host');
+            $sshUser = config('db-sync-from-prod.prod_ssh.user');
+
+            if (! $sshHost || ! $sshUser) {
+                $this->error('Production SSH connection is not configured. Set PROD_SSH_HOST and PROD_SSH_USER in your .env file.');
+
+                return Command::FAILURE;
+            }
+
+            $remotePath = config('db-sync-from-prod.prod_ssh.remote_db_path');
+
+            if (! $remotePath) {
+                $this->error('Remote database path is not configured. Set PROD_DB_PATH to the absolute path of the production SQLite file.');
+
+                return Command::FAILURE;
+            }
+
+            $this->warn("This will replace your local database ({$localPath}) with the production database ({$sshUser}@{$sshHost}:{$remotePath}).");
+        }
+
+        if (! $this->confirm('Are you sure you want to continue?')) {
+            $this->info('Aborted.');
+
+            return Command::SUCCESS;
+        }
+
+        $backupDir = $this->ensureBackupDir();
+        $timestamp = now()->format('Y-m-d_His');
+
+        // Step 1: Backup local database
+        $localBackupPath = "{$backupDir}/local-backup-{$timestamp}.sqlite";
+        if ($this->option('skip-local-backup')) {
+            $this->info('Skipping local database backup.');
+            $localBackupPath = null;
+        } elseif (! is_file($localPath)) {
+            $this->info('No local database file found; skipping local backup.');
+            $localBackupPath = null;
+        } else {
+            $this->info("Backing up local database to {$localBackupPath}...");
+            if (! $this->backupSqliteDatabase($localPath, $localBackupPath)) {
+                return Command::FAILURE;
+            }
+        }
+
+        // Step 2: Snapshot production over SSH (unless a dump was provided)
+        if ($existingDump) {
+            $prodSnapshotPath = $existingDump;
+        } else {
+            $prodSnapshotPath = "{$backupDir}/prod-dump-{$timestamp}.sqlite";
+
+            $this->info('Snapshotting production database over SSH...');
+            if (! $this->pullProdSqlite($prodSnapshotPath)) {
+                return Command::FAILURE;
+            }
+        }
+
+        // Step 3: Swap the snapshot into place
+        $this->info('Replacing local database...');
+        if (! $this->replaceSqliteDatabase($connectionName, $localPath, $prodSnapshotPath)) {
+            return Command::FAILURE;
+        }
+
+        $this->newLine();
+        $this->info('Database refresh complete!');
+        if ($localBackupPath) {
+            $this->line("  Local backup: {$localBackupPath}");
+        }
+        $this->line("  Prod dump:    {$prodSnapshotPath}");
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * Create a consistent (WAL-safe) snapshot of a local SQLite file.
+     */
+    protected function backupSqliteDatabase(string $sourcePath, string $destPath): bool
+    {
+        $result = Process::timeout(300)->run([
+            'sqlite3', $sourcePath, ".backup '{$destPath}'",
+        ]);
+
+        if (! $result->successful()) {
+            $this->error('SQLite backup failed: '.$result->errorOutput());
+            @unlink($destPath);
+
+            return false;
+        }
+
+        $this->info(sprintf('  Done. %s written.', $this->formatBytes((int) (@filesize($destPath) ?: 0))));
+
+        return true;
+    }
+
+    /**
+     * Snapshot the production SQLite file over SSH and download it.
+     */
+    protected function pullProdSqlite(string $destPath): bool
+    {
+        $sshUser = config('db-sync-from-prod.prod_ssh.user');
+        $sshHost = config('db-sync-from-prod.prod_ssh.host');
+        $sshPort = config('db-sync-from-prod.prod_ssh.port');
+        $remotePath = config('db-sync-from-prod.prod_ssh.remote_db_path');
+        $remoteTmp = '/tmp/db-sync-'.now()->format('Ymd_His').'-'.getmypid().'.sqlite';
+
+        // Take a consistent snapshot on the remote host so an active WAL is captured.
+        $remoteSnapshot = sprintf("sqlite3 %s \".backup '%s'\"", escapeshellarg($remotePath), $remoteTmp);
+        $snapshot = Process::timeout(600)->run(sprintf(
+            'ssh -o StrictHostKeyChecking=accept-new -p %s %s@%s %s',
+            escapeshellarg($sshPort),
+            escapeshellarg($sshUser),
+            escapeshellarg($sshHost),
+            escapeshellarg($remoteSnapshot),
+        ));
+
+        if (! $snapshot->successful()) {
+            $this->error('Remote snapshot failed: '.$snapshot->errorOutput());
+
+            return false;
+        }
+
+        // Download the snapshot.
+        $scp = Process::timeout(600)->run(sprintf(
+            'scp -o StrictHostKeyChecking=accept-new -P %s %s:%s %s',
+            escapeshellarg($sshPort),
+            escapeshellarg("{$sshUser}@{$sshHost}"),
+            escapeshellarg($remoteTmp),
+            escapeshellarg($destPath),
+        ));
+
+        // Always clean up the remote snapshot, regardless of the download outcome.
+        Process::run(sprintf(
+            'ssh -o StrictHostKeyChecking=accept-new -p %s %s@%s %s',
+            escapeshellarg($sshPort),
+            escapeshellarg($sshUser),
+            escapeshellarg($sshHost),
+            escapeshellarg("rm -f {$remoteTmp}"),
+        ));
+
+        if (! $scp->successful()) {
+            $this->error('Failed to download production snapshot: '.$scp->errorOutput());
+            @unlink($destPath);
+
+            return false;
+        }
+
+        $this->info(sprintf('  Done. %s downloaded.', $this->formatBytes((int) (@filesize($destPath) ?: 0))));
+
+        return true;
+    }
+
+    /**
+     * Swap a SQLite snapshot in as the local database file.
+     */
+    protected function replaceSqliteDatabase(string $connectionName, string $localPath, string $snapshotPath): bool
+    {
+        if (! is_file($snapshotPath)) {
+            $this->error("Snapshot file not found: {$snapshotPath}");
+
+            return false;
+        }
+
+        // Drop open handles so the file can be replaced cleanly.
+        DB::purge($connectionName);
+
+        // Remove stale WAL/SHM sidecars left by the previous database.
+        @unlink($localPath.'-wal');
+        @unlink($localPath.'-shm');
+
+        $dir = dirname($localPath);
+        if (! is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        if (! @copy($snapshotPath, $localPath)) {
+            $this->error("Failed to copy snapshot into place at {$localPath}.");
+
+            return false;
+        }
+
+        $this->info('  Local database replaced.');
+
+        return true;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | MySQL
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * @param  array{database: string, charset?: string, collation?: string}  $localConfig
+     */
+    private function syncMysql(string $connectionName, array $localConfig): int
+    {
         $existingDump = $this->option('dump');
 
         if ($existingDump) {
@@ -57,15 +310,7 @@ class RefreshFromProdCommand extends Command
             return Command::SUCCESS;
         }
 
-        $backupDir = config('db-sync-from-prod.backup_dir');
-        if (! is_dir($backupDir)) {
-            mkdir($backupDir, 0755, true);
-        }
-
-        $gitignorePath = "{$backupDir}/.gitignore";
-        if (! file_exists($gitignorePath)) {
-            file_put_contents($gitignorePath, "*\n!.gitignore\n");
-        }
+        $backupDir = $this->ensureBackupDir();
 
         $timestamp = now()->format('Y-m-d_His');
         $localDumpPath = "{$backupDir}/local-backup-{$timestamp}.sql";
