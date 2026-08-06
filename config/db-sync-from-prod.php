@@ -27,6 +27,25 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Production Source
+    |--------------------------------------------------------------------------
+    |
+    | Where the production data is pulled from:
+    |
+    |   ssh   - the production server is reachable over SSH; the command tunnels
+    |           to it (mysql) or copies the database file off it (sqlite).
+    |   cloud - the production database is a Laravel Cloud MySQL database with
+    |           its public endpoint enabled; the command connects to it directly
+    |           over TLS. No SSH access is involved.
+    |
+    | May be overridden per run with `--source=`.
+    |
+    */
+
+    'source' => env('DB_SYNC_SOURCE', 'ssh'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Production SSH / Database Connection
     |--------------------------------------------------------------------------
     |
@@ -54,6 +73,32 @@ return [
 
         // SQLite — absolute path to the production database file on the server.
         'remote_db_path' => env('PROD_DB_PATH'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Laravel Cloud Database Connection
+    |--------------------------------------------------------------------------
+    |
+    | Used when the source is "cloud". These are the credentials shown under
+    | "View credentials" for the database in the Laravel Cloud dashboard. The
+    | cluster's public endpoint must be enabled for the duration of the sync.
+    |
+    | Laravel Cloud requires TLS, so `ssl_mode` defaults to REQUIRED (encrypt,
+    | but don't verify the certificate). Set `ssl_ca` to a CA bundle if you want
+    | verification, or set `ssl_mode` to an empty value to omit the flag
+    | entirely — MariaDB's mysqldump does not understand --ssl-mode.
+    |
+    */
+
+    'prod_cloud' => [
+        'host' => env('PROD_DB_HOST'),
+        'port' => env('PROD_DB_PORT', '3306'),
+        'username' => env('PROD_DB_USERNAME'),
+        'password' => env('PROD_DB_PASSWORD'),
+        'database' => env('PROD_DB_DATABASE'),
+        'ssl_mode' => env('PROD_DB_SSL_MODE', 'REQUIRED'),
+        'ssl_ca' => env('PROD_DB_SSL_CA'),
     ],
 
 ];

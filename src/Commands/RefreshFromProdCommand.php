@@ -9,10 +9,11 @@ use Illuminate\Support\Facades\Process;
 class RefreshFromProdCommand extends Command
 {
     protected $signature = 'db:refresh-from-prod
+                            {--source= : Where to pull production from: ssh or cloud (Laravel Cloud)}
                             {--dump= : Path to an existing dump/snapshot file to import (skips the production download)}
                             {--skip-local-backup : Skip backing up the local database before import}';
 
-    protected $description = 'Replace the local database with a copy of the production database via SSH';
+    protected $description = 'Replace the local database with a copy of the production database';
 
     private ?int $tunnelPid = null;
 
@@ -24,20 +25,45 @@ class RefreshFromProdCommand extends Command
             return Command::FAILURE;
         }
 
+        $source = $this->source();
+
+        if (! in_array($source, ['ssh', 'cloud'], true)) {
+            $this->error("Unsupported source: {$source}. Use 'ssh' or 'cloud'.");
+
+            return Command::FAILURE;
+        }
+
         $connectionName = config('db-sync-from-prod.local_connection');
         $localConfig = config("database.connections.{$connectionName}");
         $driver = $localConfig['driver'] ?? null;
 
         return match ($driver) {
-            'sqlite' => $this->syncSqlite($connectionName, $localConfig),
+            'sqlite' => $source === 'cloud'
+                ? $this->unsupportedCloudDriver()
+                : $this->syncSqlite($connectionName, $localConfig),
             'mysql', 'mariadb' => $this->syncMysql($connectionName, $localConfig),
             default => $this->unsupportedDriver($driver),
         };
     }
 
+    /**
+     * Where production is pulled from: "ssh" or "cloud".
+     */
+    private function source(): string
+    {
+        return $this->option('source') ?: config('db-sync-from-prod.source', 'ssh');
+    }
+
     private function unsupportedDriver(?string $driver): int
     {
         $this->error('Unsupported database driver: '.($driver ?? 'null').'. Only sqlite and mysql are supported.');
+
+        return Command::FAILURE;
+    }
+
+    private function unsupportedCloudDriver(): int
+    {
+        $this->error('The cloud source only supports a MySQL local connection; Laravel Cloud does not host SQLite databases.');
 
         return Command::FAILURE;
     }
@@ -290,6 +316,16 @@ class RefreshFromProdCommand extends Command
 
             $prodDumpPath = $existingDump;
             $this->warn("This will replace your local database ({$localConfig['database']}) with the dump at {$prodDumpPath}.");
+        } elseif ($this->source() === 'cloud') {
+            $cloudConfig = $this->cloudProdConfig();
+
+            if (! $cloudConfig['host'] || ! $cloudConfig['username'] || ! $cloudConfig['database']) {
+                $this->error('Laravel Cloud connection is not configured. Set PROD_DB_HOST, PROD_DB_USERNAME, PROD_DB_PASSWORD and PROD_DB_DATABASE in your .env file.');
+
+                return Command::FAILURE;
+            }
+
+            $this->warn("This will replace your local database ({$localConfig['database']}) with the Laravel Cloud database ({$cloudConfig['database']} on {$cloudConfig['host']}).");
         } else {
             $sshHost = config('db-sync-from-prod.prod_ssh.host');
             $sshUser = config('db-sync-from-prod.prod_ssh.user');
@@ -326,31 +362,12 @@ class RefreshFromProdCommand extends Command
             }
         }
 
-        // Step 2: Open SSH tunnel and dump production database (unless a dump was provided)
+        // Step 2: Dump the production database (unless a dump was provided)
         if (! $existingDump) {
             $prodDumpPath = "{$backupDir}/prod-dump-{$timestamp}.sql";
 
-            $this->info('Opening SSH tunnel to production...');
-            $localPort = $this->openSshTunnel();
-            if (! $localPort) {
+            if (! $this->dumpProduction($prodDumpPath)) {
                 return Command::FAILURE;
-            }
-
-            try {
-                $this->info("Dumping production database to {$prodDumpPath}...");
-                $prodConfig = [
-                    'host' => '127.0.0.1',
-                    'port' => (string) $localPort,
-                    'username' => config('db-sync-from-prod.prod_ssh.db_username'),
-                    'password' => config('db-sync-from-prod.prod_ssh.db_password'),
-                    'database' => config('db-sync-from-prod.prod_ssh.database'),
-                ];
-
-                if (! $this->dumpDatabase($prodConfig, $prodDumpPath)) {
-                    return Command::FAILURE;
-                }
-            } finally {
-                $this->closeSshTunnel();
             }
         }
 
@@ -374,6 +391,60 @@ class RefreshFromProdCommand extends Command
         $this->line("  Prod dump:    {$prodDumpPath}");
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Dump the production database, reaching it the way the configured source requires.
+     */
+    private function dumpProduction(string $prodDumpPath): bool
+    {
+        if ($this->source() === 'cloud') {
+            $this->info("Dumping Laravel Cloud database to {$prodDumpPath}...");
+
+            return $this->dumpDatabase($this->cloudProdConfig(), $prodDumpPath);
+        }
+
+        $this->info('Opening SSH tunnel to production...');
+        $localPort = $this->openSshTunnel();
+        if (! $localPort) {
+            return false;
+        }
+
+        try {
+            $this->info("Dumping production database to {$prodDumpPath}...");
+
+            return $this->dumpDatabase([
+                'host' => '127.0.0.1',
+                'port' => (string) $localPort,
+                'username' => config('db-sync-from-prod.prod_ssh.db_username'),
+                'password' => config('db-sync-from-prod.prod_ssh.db_password'),
+                'database' => config('db-sync-from-prod.prod_ssh.database'),
+            ], $prodDumpPath);
+        } finally {
+            $this->closeSshTunnel();
+        }
+    }
+
+    /**
+     * Connection details for a Laravel Cloud MySQL database with a public endpoint.
+     *
+     * `--no-tablespaces` keeps mysqldump from needing the PROCESS privilege, which
+     * Laravel Cloud database users are not granted.
+     *
+     * @return array{host: ?string, port: string, username: ?string, password: ?string, database: ?string, ssl_mode: ?string, ssl_ca: ?string, options: array<int, string>}
+     */
+    private function cloudProdConfig(): array
+    {
+        return [
+            'host' => config('db-sync-from-prod.prod_cloud.host'),
+            'port' => (string) config('db-sync-from-prod.prod_cloud.port', '3306'),
+            'username' => config('db-sync-from-prod.prod_cloud.username'),
+            'password' => config('db-sync-from-prod.prod_cloud.password'),
+            'database' => config('db-sync-from-prod.prod_cloud.database'),
+            'ssl_mode' => config('db-sync-from-prod.prod_cloud.ssl_mode'),
+            'ssl_ca' => config('db-sync-from-prod.prod_cloud.ssl_ca'),
+            'options' => ['--single-transaction', '--no-tablespaces'],
+        ];
     }
 
     private function openSshTunnel(): ?int
@@ -423,7 +494,7 @@ class RefreshFromProdCommand extends Command
     }
 
     /**
-     * @param  array{host: string, port: string, username: string, password: string, database: string}  $config
+     * @param  array{host: string, port: string, username: string, password: string, database: string, ssl_mode?: ?string, ssl_ca?: ?string, options?: array<int, string>}  $config
      */
     protected function dumpDatabase(array $config, string $outputPath): bool
     {
@@ -438,13 +509,27 @@ class RefreshFromProdCommand extends Command
             '-h', $config['host'],
             '-P', $config['port'],
             '-u', $config['username'],
-            '--set-gtid-purged=OFF',
-            $config['database'],
         ];
 
         if (! empty($config['password'])) {
-            array_splice($command, 5, 0, ['-p'.$config['password']]);
+            $command[] = '-p'.$config['password'];
         }
+
+        if (! empty($config['ssl_mode'])) {
+            $command[] = '--ssl-mode='.$config['ssl_mode'];
+        }
+
+        if (! empty($config['ssl_ca'])) {
+            $command[] = '--ssl-ca='.$config['ssl_ca'];
+        }
+
+        $command[] = '--set-gtid-purged=OFF';
+
+        foreach ($config['options'] ?? [] as $option) {
+            $command[] = $option;
+        }
+
+        $command[] = $config['database'];
 
         $process = proc_open($command, [
             0 => ['pipe', 'r'],
@@ -505,16 +590,24 @@ class RefreshFromProdCommand extends Command
     }
 
     /**
-     * @param  array{host: string, port: string, username: string, password?: string, database: string}  $config
+     * @param  array{host: string, port: string, username: string, password?: string, database: string, ssl_mode?: ?string, ssl_ca?: ?string}  $config
      */
     private function estimateDatabaseSize(array $config): ?int
     {
         try {
-            $dsn = sprintf('mysql:host=%s;port=%s', $config['host'], $config['port']);
-            $pdo = new \PDO($dsn, $config['username'], $config['password'] ?? '', [
+            $options = [
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
                 \PDO::ATTR_TIMEOUT => 10,
-            ]);
+            ];
+
+            if (! empty($config['ssl_ca'])) {
+                $options[\PDO::MYSQL_ATTR_SSL_CA] = $config['ssl_ca'];
+            } elseif (! empty($config['ssl_mode'])) {
+                $options[\PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
+            }
+
+            $dsn = sprintf('mysql:host=%s;port=%s', $config['host'], $config['port']);
+            $pdo = new \PDO($dsn, $config['username'], $config['password'] ?? '', $options);
             $stmt = $pdo->prepare('SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM information_schema.tables WHERE TABLE_SCHEMA = ?');
             $stmt->execute([$config['database']]);
             $size = $stmt->fetchColumn();
