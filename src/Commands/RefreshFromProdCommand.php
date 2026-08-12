@@ -274,17 +274,25 @@ class RefreshFromProdCommand extends Command
         // Drop open handles so the file can be replaced cleanly.
         DB::purge($connectionName);
 
-        // Remove stale WAL/SHM sidecars left by the previous database.
-        @unlink($localPath.'-wal');
-        @unlink($localPath.'-shm');
+        // A configured path such as database/database.sqlite is often a symlink
+        // to the real file elsewhere. SQLite keeps its sidecars beside the real
+        // file, so resolve the link before touching them: unlinking beside the
+        // link would leave the previous database's WAL in place, and SQLite
+        // would then replay it over the incoming snapshot and report the
+        // database as malformed.
+        $targetPath = realpath($localPath) ?: $localPath;
 
-        $dir = dirname($localPath);
+        // Remove stale WAL/SHM sidecars left by the previous database.
+        @unlink($targetPath.'-wal');
+        @unlink($targetPath.'-shm');
+
+        $dir = dirname($targetPath);
         if (! is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
 
-        if (! @copy($snapshotPath, $localPath)) {
-            $this->error("Failed to copy snapshot into place at {$localPath}.");
+        if (! @copy($snapshotPath, $targetPath)) {
+            $this->error("Failed to copy snapshot into place at {$targetPath}.");
 
             return false;
         }
