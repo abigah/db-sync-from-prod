@@ -104,6 +104,28 @@ function stubSqliteCommand(): object
     return $stub;
 }
 
+/**
+ * Install a stub that skips the shell work but keeps the real file swap, so the
+ * snapshot is genuinely copied into place over the local database.
+ */
+function stubSqliteCommandWithRealReplace(): object
+{
+    $stub = new class extends RefreshFromProdCommand
+    {
+        protected function backupSqliteDatabase(string $sourcePath, string $destPath): bool
+        {
+            file_put_contents($destPath, 'stub-backup');
+            $this->info('  Done.');
+
+            return true;
+        }
+    };
+
+    app()->instance(RefreshFromProdCommand::class, $stub);
+
+    return $stub;
+}
+
 it('completes a full sqlite refresh on the happy path', function () {
     $stub = stubSqliteCommand();
 
@@ -219,6 +241,60 @@ it('aborts when the user declines the confirmation', function () {
         ->expectsConfirmation('Are you sure you want to continue?', 'no')
         ->expectsOutputToContain('Aborted.')
         ->assertExitCode(0);
+});
+
+it('clears the stale wal and shm sidecars when swapping the snapshot in', function () {
+    file_put_contents($this->localDbPath.'-wal', 'stale-wal');
+    file_put_contents($this->localDbPath.'-shm', 'stale-shm');
+
+    $dumpFile = sys_get_temp_dir().'/db-sync-snapshot-'.uniqid().'.sqlite';
+    file_put_contents($dumpFile, 'snapshot-data');
+
+    stubSqliteCommandWithRealReplace();
+
+    $this->artisan('db:refresh-from-prod', ['--dump' => $dumpFile])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(0);
+
+    expect(file_get_contents($this->localDbPath))->toBe('snapshot-data')
+        ->and(file_exists($this->localDbPath.'-wal'))->toBeFalse()
+        ->and(file_exists($this->localDbPath.'-shm'))->toBeFalse();
+
+    @unlink($dumpFile);
+});
+
+it('clears the sidecars beside the real file when the configured path is a symlink', function () {
+    // Mirrors the common Laravel layout where database/database.sqlite is a
+    // symlink to the real file under storage/.
+    $realDir = sys_get_temp_dir().'/db-sync-real-'.uniqid();
+    mkdir($realDir, 0755, true);
+    $realPath = $realDir.'/database.sqlite';
+    file_put_contents($realPath, 'local-data');
+    file_put_contents($realPath.'-wal', 'stale-wal');
+    file_put_contents($realPath.'-shm', 'stale-shm');
+
+    $linkPath = sys_get_temp_dir().'/db-sync-link-'.uniqid().'.sqlite';
+    symlink($realPath, $linkPath);
+    config()->set('database.connections.sqlite.database', $linkPath);
+
+    $dumpFile = sys_get_temp_dir().'/db-sync-snapshot-'.uniqid().'.sqlite';
+    file_put_contents($dumpFile, 'snapshot-data');
+
+    stubSqliteCommandWithRealReplace();
+
+    $this->artisan('db:refresh-from-prod', ['--dump' => $dumpFile])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(0);
+
+    expect(file_get_contents($realPath))->toBe('snapshot-data')
+        ->and(is_link($linkPath))->toBeTrue()
+        ->and(file_exists($realPath.'-wal'))->toBeFalse()
+        ->and(file_exists($realPath.'-shm'))->toBeFalse();
+
+    @unlink($dumpFile);
+    @unlink($linkPath);
+    @unlink($realPath);
+    @rmdir($realDir);
 });
 
 it('fails for an unsupported driver', function () {
