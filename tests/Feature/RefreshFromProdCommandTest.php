@@ -1,6 +1,7 @@
 <?php
 
 use Abigah\DbSyncFromProd\Commands\RefreshFromProdCommand;
+use Abigah\DbSyncFromProd\LocalAuthSnapshot;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 
@@ -46,6 +47,21 @@ function stubCommand(): object
 
         public int $importCallCount = 0;
 
+        /** @var list<string> */
+        public array $steps = [];
+
+        protected function captureLocalAuth(string $connectionName): ?LocalAuthSnapshot
+        {
+            $this->steps[] = 'capture';
+
+            return null;
+        }
+
+        protected function restoreLocalAuth(string $connectionName, ?LocalAuthSnapshot $snapshot): void
+        {
+            $this->steps[] = 'restore';
+        }
+
         protected function dumpDatabase(array $config, string $outputPath): bool
         {
             $this->dumpCallCount++;
@@ -65,6 +81,7 @@ function stubCommand(): object
         protected function importDatabase(array $config, string $dumpPath): bool
         {
             $this->importCallCount++;
+            $this->steps[] = 'import';
 
             if ($this->importShouldFail) {
                 $this->error('Import failed: stubbed');
@@ -265,6 +282,28 @@ it('uses an existing dump file when --dump is passed', function () {
     // Local dump runs (backup), but prod dump is skipped because --dump was given
     expect($stub->dumpCallCount)->toBe(1)
         ->and($stub->importCallCount)->toBe(1);
+
+    @unlink($dumpFile);
+});
+
+it('captures local auth before dropping the database and restores it after the import', function () {
+    $stub = stubCommand();
+
+    $connection = Mockery::mock();
+    $connection->shouldReceive('statement')->andReturnUsing(function () use ($stub) {
+        $stub->steps[] = 'recreate';
+    });
+
+    DB::shouldReceive('connection')->with('mysql')->andReturn($connection);
+
+    $dumpFile = tempnam(sys_get_temp_dir(), 'dump-').'.sql';
+    file_put_contents($dumpFile, "-- test dump\n");
+
+    $this->artisan('db:refresh-from-prod', ['--dump' => $dumpFile, '--skip-local-backup' => true])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(0);
+
+    expect(array_values(array_unique($stub->steps)))->toBe(['capture', 'recreate', 'import', 'restore']);
 
     @unlink($dumpFile);
 });

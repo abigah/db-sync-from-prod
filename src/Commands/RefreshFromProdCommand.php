@@ -2,6 +2,7 @@
 
 namespace Abigah\DbSyncFromProd\Commands;
 
+use Abigah\DbSyncFromProd\LocalAuthSnapshot;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
@@ -89,6 +90,63 @@ class RefreshFromProdCommand extends Command
 
     /*
     |--------------------------------------------------------------------------
+    | Local Auth
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * Capture local users' passkeys and two-factor settings before the local
+     * database is replaced, unless preserving them is turned off.
+     */
+    protected function captureLocalAuth(string $connectionName): ?LocalAuthSnapshot
+    {
+        if (! config('db-sync-from-prod.preserve_local_auth.enabled')) {
+            return null;
+        }
+
+        try {
+            $snapshot = LocalAuthSnapshot::capture(
+                DB::connection($connectionName),
+                config('db-sync-from-prod.preserve_local_auth'),
+            );
+        } catch (\Throwable $e) {
+            $this->warn('Could not capture local passkeys and two-factor settings: '.$e->getMessage());
+
+            return null;
+        }
+
+        return $snapshot->isEmpty() ? null : $snapshot;
+    }
+
+    protected function restoreLocalAuth(string $connectionName, ?LocalAuthSnapshot $snapshot): void
+    {
+        if (! $snapshot) {
+            return;
+        }
+
+        $this->info('Restoring local passkeys and two-factor settings...');
+
+        // The import ran outside this connection, so drop any handle that
+        // predates it (and the USE issued while recreating the database).
+        DB::purge($connectionName);
+
+        try {
+            $result = $snapshot->restore(DB::connection($connectionName));
+        } catch (\Throwable $e) {
+            $this->warn('  Could not restore local passkeys and two-factor settings: '.$e->getMessage());
+
+            return;
+        }
+
+        foreach ($result['warnings'] as $warning) {
+            $this->warn("  {$warning}");
+        }
+
+        $this->info("  Restored {$result['passkeys']} passkey(s) and two-factor settings for {$result['two_factor']} user(s).");
+    }
+
+    /*
+    |--------------------------------------------------------------------------
     | SQLite
     |--------------------------------------------------------------------------
     */
@@ -166,11 +224,15 @@ class RefreshFromProdCommand extends Command
             }
         }
 
+        $localAuth = is_file($localPath) ? $this->captureLocalAuth($connectionName) : null;
+
         // Step 3: Swap the snapshot into place
         $this->info('Replacing local database...');
         if (! $this->replaceSqliteDatabase($connectionName, $localPath, $prodSnapshotPath)) {
             return Command::FAILURE;
         }
+
+        $this->restoreLocalAuth($connectionName, $localAuth);
 
         $this->newLine();
         $this->info('Database refresh complete!');
@@ -379,6 +441,8 @@ class RefreshFromProdCommand extends Command
             }
         }
 
+        $localAuth = $this->captureLocalAuth($connectionName);
+
         // Step 3: Drop and recreate the local database
         $this->info('Dropping and recreating local database...');
         if (! $this->recreateDatabase($connectionName, $localConfig)) {
@@ -390,6 +454,8 @@ class RefreshFromProdCommand extends Command
         if (! $this->importDatabase($localConfig, $prodDumpPath)) {
             return Command::FAILURE;
         }
+
+        $this->restoreLocalAuth($connectionName, $localAuth);
 
         $this->newLine();
         $this->info('Database refresh complete!');
