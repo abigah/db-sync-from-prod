@@ -76,6 +76,39 @@ class LocalAuthSnapshot
     }
 
     /**
+     * Each captured passkey, described by its name and owner.
+     *
+     * @return list<string>
+     */
+    public function passkeyDescriptions(): array
+    {
+        return array_map(
+            fn (array $passkey): string => ($passkey['name'] ?? "#{$passkey['id']}")." ({$passkey['_owner']})",
+            $this->passkeys,
+        );
+    }
+
+    /**
+     * The users whose two-factor settings were captured.
+     *
+     * @return list<string>
+     */
+    public function twoFactorOwners(): array
+    {
+        return array_map(fn (array $settings): string => (string) $settings['_owner'], $this->twoFactor);
+    }
+
+    public function withoutPasskeys(): self
+    {
+        return new self($this->config, [], $this->twoFactor);
+    }
+
+    public function withoutTwoFactor(): self
+    {
+        return new self($this->config, $this->passkeys, []);
+    }
+
+    /**
      * Put the captured settings back onto the users that match them.
      *
      * @return array{passkeys: int, two_factor: int, warnings: list<string>}

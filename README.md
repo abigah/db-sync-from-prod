@@ -27,7 +27,7 @@ You must enable the cluster's public endpoint before syncing — "Org > Resource
 
 ### Keeping your local passkeys and two-factor
 
-A passkey only works on the domain it was registered on, and two-factor secrets are encrypted with the app key, so the copies production holds usually can't sign you in locally. Before the local database is replaced, the command captures local users' passkeys and two-factor settings; after the import it puts them back onto the production users with the same email:
+A passkey only works on the domain it was registered on, and two-factor secrets are encrypted with the app key, so the copies production holds usually can't sign you in locally. As soon as it starts, the command lists the local passkeys and the users with two-factor set up, and asks whether to keep each (a question with nothing to keep is skipped; `--no-interaction` keeps both). After the import it puts what you kept back onto the production users with the same email:
 
 - **Passkeys** production doesn't have (matched by `credential_id`) are inserted for that user. A passkey whose user now has a different id is still restored, with a warning: libraries such as `laravel/passkeys` derive the WebAuthn user handle from the id, so it may need registering again.
 - **Two-factor** columns (`two_factor_secret`, `two_factor_recovery_codes`, `two_factor_confirmed_at`) are put back only for users who had two-factor set up locally, so two-factor others enable in production still comes through.
