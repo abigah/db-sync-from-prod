@@ -27,6 +27,35 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Preserve Local Auth
+    |--------------------------------------------------------------------------
+    |
+    | Passkeys only work on the domain they were registered on, and two-factor
+    | secrets are encrypted with the app key, so the ones production holds
+    | rarely work locally. When enabled, the passkeys and two-factor settings
+    | of local users are captured before the refresh and put back onto the
+    | production users with the same `match_column` value afterwards.
+    |
+    | Passkeys production already has (by credential_id) are left alone. Only
+    | users with two-factor set up locally have their two-factor columns put
+    | back; the first column listed decides whether it is set up.
+    |
+    */
+
+    'preserve_local_auth' => [
+        'enabled' => env('DB_SYNC_PRESERVE_LOCAL_AUTH', true),
+        'users_table' => 'users',
+        'match_column' => 'email',
+        'passkeys_table' => 'passkeys',
+        'two_factor_columns' => [
+            'two_factor_secret',
+            'two_factor_recovery_codes',
+            'two_factor_confirmed_at',
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Production Source
     |--------------------------------------------------------------------------
     |

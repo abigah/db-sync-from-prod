@@ -25,6 +25,16 @@ You must enable the cluster's public endpoint before syncing — "Org > Resource
 3. Downloads the snapshot over `scp` and removes the remote temp file.
 4. Swaps the snapshot in as the local database file, clearing any stale `-wal`/`-shm` sidecars.
 
+### Keeping your local passkeys and two-factor
+
+A passkey only works on the domain it was registered on, and two-factor secrets are encrypted with the app key, so the copies production holds usually can't sign you in locally. Before the local database is replaced, the command captures local users' passkeys and two-factor settings; after the import it puts them back onto the production users with the same email:
+
+- **Passkeys** production doesn't have (matched by `credential_id`) are inserted for that user. A passkey whose user now has a different id is still restored, with a warning: libraries such as `laravel/passkeys` derive the WebAuthn user handle from the id, so it may need registering again.
+- **Two-factor** columns (`two_factor_secret`, `two_factor_recovery_codes`, `two_factor_confirmed_at`) are put back only for users who had two-factor set up locally, so two-factor others enable in production still comes through.
+- Users production doesn't have are skipped with a warning. Missing tables or columns are skipped silently, so apps without passkeys or Fortify are unaffected.
+
+Turn it off with `DB_SYNC_PRESERVE_LOCAL_AUTH=false`, or publish the config to change the table and column names under `preserve_local_auth`.
+
 The command refuses to run unless `APP_ENV=local`.
 
 ## Requirements
@@ -104,6 +114,7 @@ PROD_DB_DATABASE=production
 | `PROD_DB_PATH`               | ssh    | sqlite | —                            | Absolute path to the production SQLite file on the server. |
 | `DB_SYNC_LOCAL_CONNECTION`   | both   | both   | `config('database.default')` | Local connection (from `config/database.php`) to replace.  |
 | `DB_SYNC_BACKUP_DIR`         | both   | both   | `storage/backups`            | Where local and production dumps are written.              |
+| `DB_SYNC_PRESERVE_LOCAL_AUTH` | both  | both   | `true`                       | Put local passkeys and two-factor settings back after the refresh. |
 
 The `cloud` source requires a MySQL local connection; Laravel Cloud does not host SQLite databases.
 
