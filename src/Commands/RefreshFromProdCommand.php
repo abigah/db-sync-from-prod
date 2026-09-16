@@ -2,6 +2,7 @@
 
 namespace Abigah\DbSyncFromProd\Commands;
 
+use Abigah\DbSyncFromProd\CloudDatabaseEndpoint;
 use Abigah\DbSyncFromProd\LocalAuthSnapshot;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -22,6 +23,16 @@ class RefreshFromProdCommand extends Command
      * The local passkeys and two-factor settings the developer chose to keep.
      */
     private ?LocalAuthSnapshot $localAuth = null;
+
+    /**
+     * The closed Laravel Cloud endpoint the developer agreed to open for this sync.
+     */
+    private ?CloudDatabaseEndpoint $endpointToOpen = null;
+
+    /**
+     * Whether this run opened the endpoint, and so is the one to offer closing it.
+     */
+    private bool $openedEndpoint = false;
 
     public function handle(): int
     {
@@ -47,13 +58,23 @@ class RefreshFromProdCommand extends Command
             $this->localAuth = $this->askToKeepLocalAuth($connectionName, $localConfig);
         }
 
-        return match ($driver) {
-            'sqlite' => $source === 'cloud'
-                ? $this->unsupportedCloudDriver()
-                : $this->syncSqlite($connectionName, $localConfig),
-            'mysql', 'mariadb' => $this->syncMysql($connectionName, $localConfig),
-            default => $this->unsupportedDriver($driver),
-        };
+        if (in_array($driver, ['mysql', 'mariadb'], true) && ! $this->askToOpenEndpoint()) {
+            $this->info('Aborted.');
+
+            return Command::SUCCESS;
+        }
+
+        try {
+            return match ($driver) {
+                'sqlite' => $source === 'cloud'
+                    ? $this->unsupportedCloudDriver()
+                    : $this->syncSqlite($connectionName, $localConfig),
+                'mysql', 'mariadb' => $this->syncMysql($connectionName, $localConfig),
+                default => $this->unsupportedDriver($driver),
+            };
+        } finally {
+            $this->offerToCloseEndpoint();
+        }
     }
 
     /**
@@ -95,6 +116,174 @@ class RefreshFromProdCommand extends Command
         }
 
         return $backupDir;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Laravel Cloud Endpoint
+    |--------------------------------------------------------------------------
+    */
+
+    /**
+     * The cluster's public endpoint, when this run pulls from Laravel Cloud and
+     * a cluster is configured to manage.
+     */
+    protected function cloudEndpoint(): ?CloudDatabaseEndpoint
+    {
+        if ($this->option('dump') || $this->source() !== 'cloud') {
+            return null;
+        }
+
+        return CloudDatabaseEndpoint::fromConfig((array) config('db-sync-from-prod.cloud_endpoint', []));
+    }
+
+    /**
+     * Ask up front whether to open a closed endpoint; the answer is acted on
+     * only once the sync is confirmed. An endpoint that is already open is left
+     * alone, because another sync may be relying on it.
+     *
+     * @return bool False when the developer declines to open it.
+     */
+    private function askToOpenEndpoint(): bool
+    {
+        $endpoint = $this->cloudEndpoint();
+
+        if (! $endpoint) {
+            return true;
+        }
+
+        try {
+            $isPublic = $endpoint->isPublic();
+        } catch (\Throwable $e) {
+            $this->warn('Could not check the production database\'s public endpoint: '.$e->getMessage());
+
+            return true;
+        }
+
+        if ($isPublic) {
+            $this->line('The production database\'s public endpoint is already open. It will be left open, as another sync may be using it.');
+
+            return true;
+        }
+
+        if (! $this->confirm('The production database\'s public endpoint is closed. Open it for this sync?', true)) {
+            return false;
+        }
+
+        $this->endpointToOpen = $endpoint;
+
+        return true;
+    }
+
+    private function openEndpoint(): bool
+    {
+        if (! $this->endpointToOpen) {
+            return true;
+        }
+
+        $this->info('Opening the public endpoint...');
+
+        try {
+            $this->endpointToOpen->setPublic(true);
+        } catch (\Throwable $e) {
+            $this->error('Could not open the public endpoint: '.$e->getMessage());
+
+            return false;
+        }
+
+        $this->openedEndpoint = true;
+
+        // There is no one to ask on Ctrl-C, and leaving production reachable
+        // from the internet is the worse outcome, so close it and exit.
+        if (extension_loaded('pcntl')) {
+            $this->trap([SIGINT, SIGTERM], function (int $signal): void {
+                $this->closeEndpoint();
+
+                exit(128 + $signal);
+            });
+        }
+
+        if (! $this->awaitEndpoint()) {
+            $this->error('The public endpoint did not start accepting connections in time.');
+
+            return false;
+        }
+
+        $this->info('  Endpoint open.');
+
+        return true;
+    }
+
+    /**
+     * Wait for an opened endpoint to accept this machine. Cloud's proxy answers
+     * on the port whether or not the endpoint is open, so only a connection
+     * that authenticates proves the change has taken effect.
+     */
+    protected function awaitEndpoint(): bool
+    {
+        $config = $this->cloudProdConfig();
+        $deadline = microtime(true) + (int) config('db-sync-from-prod.cloud_endpoint.wait', 60);
+
+        $options = [\PDO::ATTR_TIMEOUT => 5];
+
+        if (! empty($config['ssl_ca'])) {
+            $options[\PDO::MYSQL_ATTR_SSL_CA] = $config['ssl_ca'];
+        } elseif (! empty($config['ssl_mode'])) {
+            $options[\PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
+        }
+
+        do {
+            try {
+                new \PDO(
+                    sprintf('mysql:host=%s;port=%s;dbname=%s', $config['host'], $config['port'], $config['database']),
+                    (string) $config['username'],
+                    (string) $config['password'],
+                    $options,
+                );
+
+                return true;
+            } catch (\PDOException) {
+                usleep(2_000_000);
+            }
+        } while (microtime(true) < $deadline);
+
+        return false;
+    }
+
+    /**
+     * Offer to close the endpoint this run opened, whether the sync succeeded,
+     * failed or was abandoned; the developer knows if anyone else still needs it.
+     */
+    private function offerToCloseEndpoint(): void
+    {
+        if (! $this->openedEndpoint) {
+            return;
+        }
+
+        if (! $this->confirm('Close the production database\'s public endpoint again? (say no if another sync is still using it)', true)) {
+            $this->warn('The public endpoint was left open. Close it in the Laravel Cloud dashboard when you are done.');
+
+            return;
+        }
+
+        $this->closeEndpoint();
+    }
+
+    private function closeEndpoint(): void
+    {
+        if (! $this->openedEndpoint || ! $this->endpointToOpen) {
+            return;
+        }
+
+        $this->info('Closing the public endpoint...');
+
+        try {
+            $this->endpointToOpen->setPublic(false);
+            $this->openedEndpoint = false;
+            $this->info('  Endpoint closed.');
+        } catch (\Throwable $e) {
+            $this->error('Could not close the public endpoint: '.$e->getMessage().' Close it in the Laravel Cloud dashboard.');
+        }
     }
 
     /*
@@ -519,6 +708,10 @@ class RefreshFromProdCommand extends Command
     private function dumpProduction(string $prodDumpPath): bool
     {
         if ($this->source() === 'cloud') {
+            if (! $this->openEndpoint()) {
+                return false;
+            }
+
             $this->info("Dumping Laravel Cloud database to {$prodDumpPath}...");
 
             return $this->dumpDatabase($this->cloudProdConfig(), $prodDumpPath);

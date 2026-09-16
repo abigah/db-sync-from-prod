@@ -16,7 +16,14 @@ A Laravel package that adds a `db:refresh-from-prod` Artisan command, which repl
 
 Same as above, minus the tunnel: `mysqldump` connects straight to the database's public endpoint over TLS. The dump runs with `--single-transaction` (consistent, no locking) and `--no-tablespaces` (Laravel Cloud database users are not granted the `PROCESS` privilege that `mysqldump` otherwise requires).
 
-You must enable the cluster's public endpoint before syncing — "Org > Resources > Databases > ... > Edit settings > Enable public endpoint" — and you can disable it again afterwards. Credentials come from "View credentials" on the same menu.
+The database is only reachable while the cluster's public endpoint is open. Set `LARAVEL_CLOUD_DB_CLUSTER_ID` (the `db-...` id in the cluster's dashboard URL) and the command manages it for you:
+
+- If the endpoint is closed, it asks as soon as it starts whether to open it for this sync, opens it just before the production dump, and waits until it accepts a connection.
+- When the sync finishes — or fails — it asks whether to close it again. Say no if another sync is still using it.
+- If the endpoint was already open when the command started, it is left open and you are not asked, since someone else may be relying on it.
+- On Ctrl-C it closes an endpoint it opened without asking, rather than leave production reachable.
+
+The API token is `LARAVEL_CLOUD_TOKEN`, or else each token the `cloud` CLI has stored (`~/.config/cloud/config.json`) is tried in turn. Without a cluster id, open the endpoint yourself first — "Org > Resources > Databases > ... > Edit settings > Enable public endpoint". Credentials come from "View credentials" on the same menu.
 
 ### SQLite
 
@@ -112,6 +119,8 @@ PROD_DB_DATABASE=production
 | `PROD_DB_SSL_MODE`           | cloud  | mysql  | `REQUIRED`                   | `--ssl-mode` passed to `mysqldump`. Leave empty to omit it. |
 | `PROD_DB_SSL_CA`             | cloud  | mysql  | —                            | CA bundle to verify the server certificate against.        |
 | `PROD_DB_PATH`               | ssh    | sqlite | —                            | Absolute path to the production SQLite file on the server. |
+| `LARAVEL_CLOUD_DB_CLUSTER_ID` | cloud | mysql  | —                            | Cluster whose public endpoint the command offers to open and close. |
+| `LARAVEL_CLOUD_TOKEN`        | cloud  | mysql  | the `cloud` CLI's tokens     | Laravel Cloud API token used to open and close the endpoint. |
 | `DB_SYNC_LOCAL_CONNECTION`   | both   | both   | `config('database.default')` | Local connection (from `config/database.php`) to replace.  |
 | `DB_SYNC_BACKUP_DIR`         | both   | both   | `storage/backups`            | Where local and production dumps are written.              |
 | `DB_SYNC_PRESERVE_LOCAL_AUTH` | both  | both   | `true`                       | Put local passkeys and two-factor settings back after the refresh. |

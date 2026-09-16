@@ -29,6 +29,9 @@ abstract class TestCase extends OrchestraTestCase
         // or leave unreachable; the tests for it turn it back on.
         $app['config']->set('db-sync-from-prod.preserve_local_auth.enabled', false);
 
+        // Never reach the real Laravel Cloud API from a developer's machine.
+        $app['config']->set('db-sync-from-prod.cloud_endpoint.cluster_id', null);
+
         $app['config']->set('database.default', 'mysql');
         $app['config']->set('database.connections.mysql', [
             'driver' => 'mysql',

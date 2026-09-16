@@ -130,4 +130,31 @@ return [
         'ssl_ca' => env('PROD_DB_SSL_CA'),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Laravel Cloud Public Endpoint
+    |--------------------------------------------------------------------------
+    |
+    | A Cloud database is only reachable from your machine while its cluster's
+    | public endpoint is open, and it is safest left closed. Set a cluster id
+    | and, when the endpoint is closed, the command asks whether to open it,
+    | opens it just before the dump, and afterwards asks whether to close it
+    | again. An endpoint that is already open is left open, as another sync
+    | may be using it.
+    |
+    | The cluster id is the `db-...` id in the cluster's dashboard URL. The API
+    | token is LARAVEL_CLOUD_TOKEN, or else each token the `cloud` CLI has
+    | stored is tried in turn. `wait` is how many seconds to wait for an
+    | opened endpoint to accept connections.
+    |
+    */
+
+    'cloud_endpoint' => [
+        'cluster_id' => env('LARAVEL_CLOUD_DB_CLUSTER_ID'),
+        'api_url' => env('LARAVEL_CLOUD_API_URL', 'https://cloud.laravel.com/api'),
+        'token' => env('LARAVEL_CLOUD_TOKEN'),
+        'token_file' => env('LARAVEL_CLOUD_TOKEN_FILE', ($home = env('HOME')) ? $home.'/.config/cloud/config.json' : null),
+        'wait' => 60,
+    ],
+
 ];
