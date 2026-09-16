@@ -18,6 +18,11 @@ class RefreshFromProdCommand extends Command
 
     private ?int $tunnelPid = null;
 
+    /**
+     * The local passkeys and two-factor settings the developer chose to keep.
+     */
+    private ?LocalAuthSnapshot $localAuth = null;
+
     public function handle(): int
     {
         if (! app()->environment('local')) {
@@ -37,6 +42,10 @@ class RefreshFromProdCommand extends Command
         $connectionName = config('db-sync-from-prod.local_connection');
         $localConfig = config("database.connections.{$connectionName}");
         $driver = $localConfig['driver'] ?? null;
+
+        if (in_array($driver, ['sqlite', 'mysql', 'mariadb'], true)) {
+            $this->localAuth = $this->askToKeepLocalAuth($connectionName, $localConfig);
+        }
 
         return match ($driver) {
             'sqlite' => $source === 'cloud'
@@ -95,8 +104,49 @@ class RefreshFromProdCommand extends Command
     */
 
     /**
-     * Capture local users' passkeys and two-factor settings before the local
-     * database is replaced, unless preserving them is turned off.
+     * Ask up front whether to keep the local passkeys and two-factor settings,
+     * naming what each answer covers, and skip any question with nothing to keep.
+     *
+     * @param  array{driver: string, database: string}  $localConfig
+     */
+    private function askToKeepLocalAuth(string $connectionName, array $localConfig): ?LocalAuthSnapshot
+    {
+        if ($localConfig['driver'] === 'sqlite' && ! is_file($localConfig['database'])) {
+            return null;
+        }
+
+        $snapshot = $this->captureLocalAuth($connectionName);
+
+        if (! $snapshot) {
+            return null;
+        }
+
+        $passkeys = $snapshot->passkeyDescriptions();
+
+        if ($passkeys !== []) {
+            $this->line('Local passkeys: '.implode(', ', $passkeys));
+
+            if (! $this->confirm('Keep your local passkeys? (ones production already has are unaffected)', true)) {
+                $snapshot = $snapshot->withoutPasskeys();
+            }
+        }
+
+        $twoFactorOwners = $snapshot->twoFactorOwners();
+
+        if ($twoFactorOwners !== []) {
+            $this->line('Local two-factor settings: '.implode(', ', $twoFactorOwners));
+
+            if (! $this->confirm('Keep your local two-factor settings? (otherwise production\'s are used)', true)) {
+                $snapshot = $snapshot->withoutTwoFactor();
+            }
+        }
+
+        return $snapshot->isEmpty() ? null : $snapshot;
+    }
+
+    /**
+     * Capture local users' passkeys and two-factor settings, unless preserving
+     * them is turned off.
      */
     protected function captureLocalAuth(string $connectionName): ?LocalAuthSnapshot
     {
@@ -224,15 +274,13 @@ class RefreshFromProdCommand extends Command
             }
         }
 
-        $localAuth = is_file($localPath) ? $this->captureLocalAuth($connectionName) : null;
-
         // Step 3: Swap the snapshot into place
         $this->info('Replacing local database...');
         if (! $this->replaceSqliteDatabase($connectionName, $localPath, $prodSnapshotPath)) {
             return Command::FAILURE;
         }
 
-        $this->restoreLocalAuth($connectionName, $localAuth);
+        $this->restoreLocalAuth($connectionName, $this->localAuth);
 
         $this->newLine();
         $this->info('Database refresh complete!');
@@ -441,8 +489,6 @@ class RefreshFromProdCommand extends Command
             }
         }
 
-        $localAuth = $this->captureLocalAuth($connectionName);
-
         // Step 3: Drop and recreate the local database
         $this->info('Dropping and recreating local database...');
         if (! $this->recreateDatabase($connectionName, $localConfig)) {
@@ -455,7 +501,7 @@ class RefreshFromProdCommand extends Command
             return Command::FAILURE;
         }
 
-        $this->restoreLocalAuth($connectionName, $localAuth);
+        $this->restoreLocalAuth($connectionName, $this->localAuth);
 
         $this->newLine();
         $this->info('Database refresh complete!');

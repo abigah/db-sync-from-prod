@@ -25,6 +25,10 @@ abstract class TestCase extends OrchestraTestCase
     {
         $app->detectEnvironment(fn () => 'local');
 
+        // Capturing local auth reads the local database, which most tests fake
+        // or leave unreachable; the tests for it turn it back on.
+        $app['config']->set('db-sync-from-prod.preserve_local_auth.enabled', false);
+
         $app['config']->set('database.default', 'mysql');
         $app['config']->set('database.connections.mysql', [
             'driver' => 'mysql',

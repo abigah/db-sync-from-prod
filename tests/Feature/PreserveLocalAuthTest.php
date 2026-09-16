@@ -15,6 +15,7 @@ beforeEach(function () {
 
     config()->set('db-sync-from-prod.local_connection', 'sqlite');
     config()->set('db-sync-from-prod.backup_dir', $this->tempBackupDir);
+    config()->set('db-sync-from-prod.preserve_local_auth.enabled', true);
 
     // The local site: the developer has a passkey production has never seen,
     // and two-factor set up with their local app key.
@@ -68,9 +69,11 @@ function createAuthDatabase(string $path, Closure $seed): void
     $seed($db);
 }
 
-function refreshFromProdDump(object $test): object
+function refreshFromProdDump(object $test, string $keepPasskeys = 'yes', string $keepTwoFactor = 'yes'): object
 {
     return $test->artisan('db:refresh-from-prod', ['--dump' => $test->prodDbPath])
+        ->expectsConfirmation('Keep your local passkeys? (ones production already has are unaffected)', $keepPasskeys)
+        ->expectsConfirmation("Keep your local two-factor settings? (otherwise production's are used)", $keepTwoFactor)
         ->expectsConfirmation('Are you sure you want to continue?', 'yes');
 }
 
@@ -121,10 +124,32 @@ it('skips auth for users production does not have', function () {
     expect(DB::connection('sqlite')->table('passkeys')->count())->toBe(0);
 });
 
+it('asks about passkeys and two-factor right away, naming what each covers', function () {
+    refreshFromProdDump($this)
+        ->expectsOutputToContain('Local passkeys: Prod key (dev@example.com), Local key (dev@example.com)')
+        ->expectsOutputToContain('Local two-factor settings: dev@example.com')
+        ->assertExitCode(0);
+});
+
+it('keeps only the local passkeys when two-factor is declined', function () {
+    refreshFromProdDump($this, keepPasskeys: 'yes', keepTwoFactor: 'no')->assertExitCode(0);
+
+    expect(DB::connection('sqlite')->table('passkeys')->count())->toBe(2)
+        ->and(DB::connection('sqlite')->table('users')->where('id', 1)->value('two_factor_secret'))->toBe('prod-secret');
+});
+
+it('keeps only the local two-factor settings when passkeys are declined', function () {
+    refreshFromProdDump($this, keepPasskeys: 'no', keepTwoFactor: 'yes')->assertExitCode(0);
+
+    expect(DB::connection('sqlite')->table('passkeys')->pluck('credential_id')->all())->toBe(['prod-credential'])
+        ->and(DB::connection('sqlite')->table('users')->where('id', 1)->value('two_factor_secret'))->toBe('local-secret');
+});
+
 it('leaves the production copy untouched when preserving local auth is disabled', function () {
     config()->set('db-sync-from-prod.preserve_local_auth.enabled', false);
 
-    refreshFromProdDump($this)
+    $this->artisan('db:refresh-from-prod', ['--dump' => $this->prodDbPath])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
         ->doesntExpectOutputToContain('Restoring local passkeys')
         ->assertExitCode(0);
 
@@ -138,7 +163,9 @@ it('refreshes normally when the app has no passkeys or two-factor columns', func
         (new PDO('sqlite:'.$path))->exec('CREATE TABLE users (id integer primary key, email text)');
     }
 
-    refreshFromProdDump($this)
+    // Nothing to keep, so neither question is asked.
+    $this->artisan('db:refresh-from-prod', ['--dump' => $this->prodDbPath])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
         ->doesntExpectOutputToContain('Restoring local passkeys')
         ->expectsOutputToContain('Database refresh complete!')
         ->assertExitCode(0);
