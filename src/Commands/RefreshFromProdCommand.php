@@ -7,6 +7,7 @@ use Abigah\DbSyncFromProd\LocalAuthSnapshot;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Sleep;
 
 class RefreshFromProdCommand extends Command
 {
@@ -714,6 +715,16 @@ class RefreshFromProdCommand extends Command
 
             $this->info("Dumping Laravel Cloud database to {$prodDumpPath}...");
 
+            if ($this->dumpDatabase($this->cloudProdConfig(), $prodDumpPath)) {
+                return true;
+            }
+
+            // A small Flex cluster can drop the connection part way through a
+            // dump (Lost connection, 2013) and be fine a moment later, so a
+            // dropped dump gets one more try before the sync gives up.
+            $this->warn('Retrying the dump once in 5 seconds...');
+            Sleep::for(5)->seconds();
+
             return $this->dumpDatabase($this->cloudProdConfig(), $prodDumpPath);
         }
 
@@ -744,6 +755,13 @@ class RefreshFromProdCommand extends Command
      * `--no-tablespaces` keeps mysqldump from needing the PROCESS privilege, which
      * Laravel Cloud database users are not granted.
      *
+     * `--skip-extended-insert` writes one row per INSERT, which Laravel Cloud
+     * recommends for dumps from small instances: multi-row inserts make the
+     * server buffer far more per statement, and a 512 MB Flex cluster can drop
+     * the connection under that load. `--no-autocommit` wraps each table's
+     * inserts in one transaction so the many single-row inserts still import
+     * quickly.
+     *
      * @return array{host: ?string, port: string, username: ?string, password: ?string, database: ?string, ssl_mode: ?string, ssl_ca: ?string, options: array<int, string>}
      */
     private function cloudProdConfig(): array
@@ -756,7 +774,7 @@ class RefreshFromProdCommand extends Command
             'database' => config('db-sync-from-prod.prod_cloud.database'),
             'ssl_mode' => config('db-sync-from-prod.prod_cloud.ssl_mode'),
             'ssl_ca' => config('db-sync-from-prod.prod_cloud.ssl_ca'),
-            'options' => ['--single-transaction', '--no-tablespaces'],
+            'options' => ['--single-transaction', '--no-tablespaces', '--skip-extended-insert', '--no-autocommit'],
         ];
     }
 

@@ -3,6 +3,7 @@
 use Abigah\DbSyncFromProd\Commands\RefreshFromProdCommand;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Sleep;
 
 beforeEach(function () {
     $this->tempBackupDir = sys_get_temp_dir().'/db-sync-tests-'.uniqid();
@@ -41,9 +42,18 @@ function stubCloudCommand(): object
 
         public int $importCallCount = 0;
 
+        /** How many dumps fail, as a dropped connection would, before they succeed. */
+        public int $failingDumps = 0;
+
         protected function dumpDatabase(array $config, string $outputPath): bool
         {
             $this->dumpConfigs[] = $config;
+
+            if ($this->failingDumps-- > 0) {
+                $this->error('mysqldump failed: Lost connection to MySQL server during query (2013)');
+
+                return false;
+            }
 
             file_put_contents($outputPath, '-- stubbed dump');
             $this->info('  Done.');
@@ -113,7 +123,40 @@ it('dumps production with the Laravel Cloud credentials', function () {
             'ssl_mode' => 'REQUIRED',
         ])
         ->and($stub->dumpConfigs[0]['options'])
-        ->toContain('--single-transaction', '--no-tablespaces');
+        ->toContain('--single-transaction', '--no-tablespaces', '--skip-extended-insert', '--no-autocommit');
+});
+
+it('retries a dropped dump once before giving up', function () {
+    Sleep::fake();
+
+    $stub = stubCloudCommand();
+    $stub->failingDumps = 1;
+    mockLocalRecreate();
+
+    $this->artisan('db:refresh-from-prod', ['--skip-local-backup' => true])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->expectsOutputToContain('Retrying the dump once')
+        ->assertExitCode(0);
+
+    expect($stub->dumpConfigs)->toHaveCount(2)
+        ->and($stub->importCallCount)->toBe(1);
+
+    Sleep::assertSleptTimes(1);
+});
+
+it('gives up when the retried dump fails too', function () {
+    Sleep::fake();
+
+    $stub = stubCloudCommand();
+    $stub->failingDumps = 2;
+    mockLocalRecreate();
+
+    $this->artisan('db:refresh-from-prod', ['--skip-local-backup' => true])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(1);
+
+    expect($stub->dumpConfigs)->toHaveCount(2)
+        ->and($stub->importCallCount)->toBe(0);
 });
 
 it('uses the cloud source when --source=cloud is passed', function () {

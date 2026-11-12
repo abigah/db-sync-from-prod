@@ -4,6 +4,7 @@ use Abigah\DbSyncFromProd\Commands\RefreshFromProdCommand;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Sleep;
 
 const OPEN_QUESTION = "The production database's public endpoint is closed. Open it for this sync?";
 const CLOSE_QUESTION = "Close the production database's public endpoint again? (say no if another sync is still using it)";
@@ -154,6 +155,7 @@ it('leaves the endpoint open when closing it is declined', function () {
 });
 
 it('still offers to close the endpoint when the sync fails after opening it', function () {
+    Sleep::fake();
     $this->command->dumpShouldFail = true;
 
     $this->artisan('db:refresh-from-prod', ['--skip-local-backup' => true])
@@ -162,7 +164,8 @@ it('still offers to close the endpoint when the sync fails after opening it', fu
         ->expectsConfirmation(CLOSE_QUESTION, 'yes')
         ->assertExitCode(1);
 
-    expect($this->steps)->toBe(['open', 'dump', 'close']);
+    // The dump is retried once before the sync gives up and closes the endpoint.
+    expect($this->steps)->toBe(['open', 'dump', 'dump', 'close']);
 });
 
 it('stops before dumping and offers to close when the opened endpoint never accepts a connection', function () {
