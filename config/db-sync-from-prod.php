@@ -113,10 +113,12 @@ return [
     | "View credentials" for the database in the Laravel Cloud dashboard. The
     | cluster's public endpoint must be enabled for the duration of the sync.
     |
-    | Laravel Cloud requires TLS, so `ssl_mode` defaults to REQUIRED (encrypt,
-    | but don't verify the certificate). Set `ssl_ca` to a CA bundle if you want
-    | verification, or set `ssl_mode` to an empty value to omit the flag
-    | entirely — MariaDB's mysqldump does not understand --ssl-mode.
+    | Laravel Cloud requires TLS, so `ssl_mode` defaults to REQUIRED. When
+    | `ssl_ca` is empty the system CA bundle is found and used (SSL_CERT_FILE,
+    | then OpenSSL's default, then the usual Linux and macOS paths) — PHP's
+    | MySQL driver will not use TLS without one. Set `ssl_ca` to override it, or
+    | set `ssl_mode` to an empty value to omit the flag entirely — MariaDB's
+    | mysqldump does not understand --ssl-mode.
     |
     */
 

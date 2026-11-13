@@ -235,3 +235,46 @@ it('fails for an unknown source', function () {
         ->expectsOutputToContain("Unsupported source: ftp. Use 'ssh' or 'cloud'.")
         ->assertExitCode(1);
 });
+
+it('uses the system ca bundle when tls is on and no ca is configured', function () {
+    $bundle = tempnam(sys_get_temp_dir(), 'ca');
+    putenv("SSL_CERT_FILE={$bundle}");
+
+    try {
+        $stub = stubCloudCommand();
+        mockLocalRecreate();
+
+        $this->artisan('db:refresh-from-prod', ['--skip-local-backup' => true])
+            ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+            ->assertExitCode(0);
+
+        expect($stub->dumpConfigs[0]['ssl_ca'])->toBe($bundle);
+    } finally {
+        putenv('SSL_CERT_FILE');
+        unlink($bundle);
+    }
+});
+
+it('prefers a configured ca over the system bundle', function () {
+    config()->set('db-sync-from-prod.prod_cloud.ssl_ca', '/opt/certs/cloud.pem');
+    $stub = stubCloudCommand();
+    mockLocalRecreate();
+
+    $this->artisan('db:refresh-from-prod', ['--skip-local-backup' => true])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(0);
+
+    expect($stub->dumpConfigs[0]['ssl_ca'])->toBe('/opt/certs/cloud.pem');
+});
+
+it('leaves tls alone when ssl_mode is turned off', function () {
+    config()->set('db-sync-from-prod.prod_cloud.ssl_mode', '');
+    $stub = stubCloudCommand();
+    mockLocalRecreate();
+
+    $this->artisan('db:refresh-from-prod', ['--skip-local-backup' => true])
+        ->expectsConfirmation('Are you sure you want to continue?', 'yes')
+        ->assertExitCode(0);
+
+    expect($stub->dumpConfigs[0]['ssl_ca'])->toBeNull();
+});

@@ -117,7 +117,7 @@ PROD_DB_DATABASE=production
 | `PROD_DB_PASSWORD`           | both   | mysql  | `` (empty)                   | DB password on production.                                 |
 | `PROD_DB_DATABASE`           | both   | mysql  | —                            | Name of the production database.                           |
 | `PROD_DB_SSL_MODE`           | cloud  | mysql  | `REQUIRED`                   | `--ssl-mode` passed to `mysqldump`. Leave empty to omit it. |
-| `PROD_DB_SSL_CA`             | cloud  | mysql  | —                            | CA bundle to verify the server certificate against.        |
+| `PROD_DB_SSL_CA`             | cloud  | mysql  | the system CA bundle         | CA bundle to verify the server certificate against.        |
 | `PROD_DB_PATH`               | ssh    | sqlite | —                            | Absolute path to the production SQLite file on the server. |
 | `LARAVEL_CLOUD_DB_CLUSTER_ID` | cloud | mysql  | —                            | Cluster whose public endpoint the command offers to open and close. |
 | `LARAVEL_CLOUD_TOKEN`        | cloud  | mysql  | the `cloud` CLI's tokens     | Laravel Cloud API token used to open and close the endpoint. |
@@ -129,7 +129,7 @@ The `cloud` source requires a MySQL local connection; Laravel Cloud does not hos
 
 #### SSL notes
 
-Laravel Cloud requires TLS, so the dump runs with `--ssl-mode=REQUIRED` by default: the connection is encrypted, but the certificate is not verified. To verify it, point `PROD_DB_SSL_CA` at a CA bundle (`/etc/ssl/certs/ca-certificates.crt` on Linux, `$(brew --prefix)/etc/ca-certificates/cert.pem` on macOS). Avoid `VERIFY_IDENTITY` — the endpoint hostname does not match the certificate.
+Laravel Cloud requires TLS, so the dump runs with `--ssl-mode=REQUIRED` by default. If `PROD_DB_SSL_CA` is not set, the system CA bundle is used: `SSL_CERT_FILE` if set, then OpenSSL's default file, then `/etc/ssl/cert.pem` (macOS), `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu) or `/etc/pki/tls/certs/ca-bundle.crt` (RHEL/Fedora). This matters for the PHP connections the command makes (to wait for the endpoint and to estimate the dump size): PHP's MySQL driver will not use TLS without a CA, and Laravel Cloud drops an unencrypted connection. Set `PROD_DB_SSL_CA` yourself if your bundle lives somewhere else. Avoid `VERIFY_IDENTITY` — the endpoint hostname does not match the certificate.
 
 MariaDB's `mysqldump` does not understand `--ssl-mode`. If you're using it, set `PROD_DB_SSL_MODE=` (empty) to drop the flag; the client negotiates TLS on its own.
 

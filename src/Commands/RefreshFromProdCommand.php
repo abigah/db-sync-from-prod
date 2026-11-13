@@ -225,13 +225,7 @@ class RefreshFromProdCommand extends Command
         $config = $this->cloudProdConfig();
         $deadline = microtime(true) + (int) config('db-sync-from-prod.cloud_endpoint.wait', 60);
 
-        $options = [\PDO::ATTR_TIMEOUT => 5];
-
-        if (! empty($config['ssl_ca'])) {
-            $options[\PDO::MYSQL_ATTR_SSL_CA] = $config['ssl_ca'];
-        } elseif (! empty($config['ssl_mode'])) {
-            $options[\PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
-        }
+        $options = [\PDO::ATTR_TIMEOUT => 5] + $this->pdoSslOptions($config);
 
         do {
             try {
@@ -766,16 +760,67 @@ class RefreshFromProdCommand extends Command
      */
     private function cloudProdConfig(): array
     {
+        $sslMode = config('db-sync-from-prod.prod_cloud.ssl_mode');
+
         return [
             'host' => config('db-sync-from-prod.prod_cloud.host'),
             'port' => (string) config('db-sync-from-prod.prod_cloud.port', '3306'),
             'username' => config('db-sync-from-prod.prod_cloud.username'),
             'password' => config('db-sync-from-prod.prod_cloud.password'),
             'database' => config('db-sync-from-prod.prod_cloud.database'),
-            'ssl_mode' => config('db-sync-from-prod.prod_cloud.ssl_mode'),
-            'ssl_ca' => config('db-sync-from-prod.prod_cloud.ssl_ca'),
+            'ssl_mode' => $sslMode,
+            'ssl_ca' => config('db-sync-from-prod.prod_cloud.ssl_ca') ?: (empty($sslMode) ? null : $this->systemCaBundle()),
             'options' => ['--single-transaction', '--no-tablespaces', '--skip-extended-insert', '--no-autocommit'],
         ];
+    }
+
+    /**
+     * The machine's own CA bundle, used when TLS is on but no `ssl_ca` is set.
+     *
+     * PHP's mysqlnd only negotiates TLS when it is given a CA (or a client
+     * certificate): turning off certificate verification on its own leaves the
+     * connection in plain text, and Laravel Cloud refuses it. Laravel Cloud's
+     * certificates are issued by a public CA, so the bundle the OS already
+     * trusts is enough to connect.
+     */
+    protected function systemCaBundle(): ?string
+    {
+        $candidates = [
+            getenv('SSL_CERT_FILE') ?: null,
+            openssl_get_cert_locations()['default_cert_file'] ?? null,
+            '/etc/ssl/cert.pem',                    // macOS, Alpine
+            '/etc/ssl/certs/ca-certificates.crt',   // Debian, Ubuntu
+            '/etc/pki/tls/certs/ca-bundle.crt',     // RHEL, Fedora
+        ];
+
+        foreach ($candidates as $candidate) {
+            if ($candidate !== null && is_file($candidate) && is_readable($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * TLS options for a PDO connection to the source database.
+     *
+     * @param  array{ssl_mode?: ?string, ssl_ca?: ?string}  $config
+     * @return array<int, mixed>
+     */
+    private function pdoSslOptions(array $config): array
+    {
+        if (! empty($config['ssl_ca'])) {
+            return [\PDO::MYSQL_ATTR_SSL_CA => $config['ssl_ca']];
+        }
+
+        if (! empty($config['ssl_mode'])) {
+            // Without a CA, mysqlnd may not negotiate TLS at all; this is a
+            // last resort for a machine with no bundle to find.
+            return [\PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT => false];
+        }
+
+        return [];
     }
 
     private function openSshTunnel(): ?int
@@ -929,13 +974,7 @@ class RefreshFromProdCommand extends Command
             $options = [
                 \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
                 \PDO::ATTR_TIMEOUT => 10,
-            ];
-
-            if (! empty($config['ssl_ca'])) {
-                $options[\PDO::MYSQL_ATTR_SSL_CA] = $config['ssl_ca'];
-            } elseif (! empty($config['ssl_mode'])) {
-                $options[\PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
-            }
+            ] + $this->pdoSslOptions($config);
 
             $dsn = sprintf('mysql:host=%s;port=%s', $config['host'], $config['port']);
             $pdo = new \PDO($dsn, $config['username'], $config['password'] ?? '', $options);
